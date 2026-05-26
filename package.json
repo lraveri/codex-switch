@@ -1,0 +1,44 @@
+{
+  "name": "codex-switch",
+  "version": "0.1.0",
+  "description": "CLI and library to switch between Codex auth.json profiles",
+  "type": "module",
+  "bin": {
+    "codex-switch": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test test/core.test.ts test/cli.test.ts",
+    "dev:native": "node src/cli.ts",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "keywords": [
+    "codex",
+    "openai",
+    "cli",
+    "profiles",
+    "auth"
+  ],
+  "author": "Luca Raveri",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}
