@@ -307,6 +307,434 @@ test("saveProfile and loadProfile support the opencode provider", async () => {
   );
 });
 
+test("saveProfile refuses to overwrite an existing openai profile when the current email differs", async () => {
+  const { manager, codexHome, opencodeDataDir } = await setupManager();
+  const personalAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-personal",
+        refresh_token: "refresh-personal",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const workAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@talentware.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_work"
+          }
+        }),
+        access_token: "access-work",
+        refresh_token: "refresh-work",
+        account_id: "acc_work"
+      }
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), personalAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal"
+    }
+  });
+  await manager.saveProfile("luca", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), workAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-work",
+      email: "luca@talentware.com",
+      accountId: "acc_work",
+      refresh: "openai-refresh-work"
+    }
+  });
+
+  await assert.rejects(
+    () => manager.saveProfile("luca", "openai"),
+    /current auth email "luca@talentware\.com" does not match saved profile email "luca@example\.com"/
+  );
+});
+
+test("loadProfile refuses to sync the active openai profile when the current email differs", async () => {
+  const { manager, codexHome, opencodeDataDir } = await setupManager();
+  const personalAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-personal",
+        refresh_token: "refresh-personal",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const workAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@talentware.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_work"
+          }
+        }),
+        access_token: "access-work",
+        refresh_token: "refresh-work",
+        account_id: "acc_work"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const secondAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "second@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_second"
+          }
+        }),
+        access_token: "access-second",
+        refresh_token: "refresh-second",
+        account_id: "acc_second"
+      }
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), personalAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal"
+    }
+  });
+  await manager.saveProfile("luca", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), secondAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-second",
+      email: "second@example.com",
+      accountId: "acc_second",
+      refresh: "openai-refresh-second"
+    }
+  });
+  await manager.saveProfile("second", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), workAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-work",
+      email: "luca@talentware.com",
+      accountId: "acc_work",
+      refresh: "openai-refresh-work"
+    }
+  });
+
+  await assert.rejects(
+    () => manager.loadProfile("luca", "openai"),
+    /Refusing to sync profile "second": current auth email "luca@talentware\.com" does not match saved profile email "second@example\.com"/
+  );
+});
+
+test("saveProfile allows overwriting an existing openai profile when the email differs only by case", async () => {
+  const { manager, codexHome, opencodeDataDir } = await setupManager();
+  const lowerCaseAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-lower",
+        refresh_token: "refresh-lower",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const mixedCaseAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "Luca@Example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-mixed",
+        refresh_token: "refresh-mixed",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), lowerCaseAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-lower",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-lower"
+    }
+  });
+  await manager.saveProfile("luca", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), mixedCaseAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-mixed",
+      email: "Luca@Example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-mixed"
+    }
+  });
+
+  const result = await manager.saveProfile("luca", "openai");
+
+  assert.equal(result.profile.email, "Luca@Example.com");
+});
+
+test("saveProfile allows overwriting an existing openai profile when the saved email is missing", async () => {
+  const { manager, codexHome, opencodeDataDir } = await setupManager();
+  const apiKeyAuth = `${JSON.stringify(
+    {
+      auth_mode: "api_key",
+      OPENAI_API_KEY: "sk-test-personal"
+    },
+    null,
+    2
+  )}\n`;
+  const oauthAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-oauth",
+        refresh_token: "refresh-oauth",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), apiKeyAuth, "utf8");
+  await manager.saveProfile("luca", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), oauthAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal"
+    }
+  });
+
+  const result = await manager.saveProfile("luca", "openai");
+
+  assert.equal(result.profile.email, "luca@example.com");
+});
+
+test("saveProfile allows overwriting an existing openai profile when the current email is missing", async () => {
+  const { manager, codexHome, opencodeDataDir } = await setupManager();
+  const oauthAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-oauth",
+        refresh_token: "refresh-oauth",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const apiKeyAuth = `${JSON.stringify(
+    {
+      auth_mode: "api_key",
+      OPENAI_API_KEY: "sk-test-work"
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), oauthAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal"
+    }
+  });
+  await manager.saveProfile("luca", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), apiKeyAuth, "utf8");
+
+  const result = await manager.saveProfile("luca", "openai");
+
+  assert.equal(result.profile.email, null);
+  assert.equal(result.profile.authMode, "api_key");
+});
+
+test("loadProfile allows syncing the active openai profile when the email differs only by case", async () => {
+  const { manager, codexHome, opencodeDataDir } = await setupManager();
+  const personalAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-personal",
+        refresh_token: "refresh-personal",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const workAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "work@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_work"
+          }
+        }),
+        access_token: "access-work",
+        refresh_token: "refresh-work",
+        account_id: "acc_work"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const personalRefreshedAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "LUCA@EXAMPLE.COM",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-personal-2",
+        refresh_token: "refresh-personal-2",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), personalAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal"
+    }
+  });
+  await manager.saveProfile("luca", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), workAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-work",
+      email: "work@example.com",
+      accountId: "acc_work",
+      refresh: "openai-refresh-work"
+    }
+  });
+  await manager.saveProfile("work", "openai");
+
+  await writeFile(path.join(codexHome, "auth.json"), personalRefreshedAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "LUCA@EXAMPLE.COM",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal-2"
+    }
+  });
+
+  const result = await manager.loadProfile("work", "openai");
+
+  assert.equal(result.syncedProfile?.name, "luca");
+  assert.equal(result.syncedProfile?.email, "LUCA@EXAMPLE.COM");
+});
+
 test("renameProfile and removeProfile update the registry consistently", async () => {
   const { manager, codexHome, opencodeDataDir } = await setupManager();
   const authContent = `${JSON.stringify(

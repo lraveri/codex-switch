@@ -402,3 +402,267 @@ test("CLI save and load work for the opencode provider", async () => {
     "sk-opencode-personal"
   );
 });
+
+test("CLI save refuses to overwrite an existing openai profile when the current email differs", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "codex-switch-cli-"));
+  const storageDir = path.join(rootDir, "storage");
+  const codexHome = path.join(rootDir, "codex");
+  const opencodeDataDir = path.join(rootDir, "opencode");
+  await mkdir(codexHome, { recursive: true });
+  await mkdir(opencodeDataDir, { recursive: true });
+
+  const personalAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-personal",
+        refresh_token: "refresh-personal",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const workAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@talentware.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_work"
+          }
+        }),
+        access_token: "access-work",
+        refresh_token: "refresh-work",
+        account_id: "acc_work"
+      }
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), personalAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal"
+    }
+  });
+  await runCli([
+    "--storage-dir",
+    storageDir,
+    "--codex-home",
+    codexHome,
+    "--opencode-data-dir",
+    opencodeDataDir,
+    "--provider",
+    "openai",
+    "save",
+    "luca"
+  ]);
+
+  await writeFile(path.join(codexHome, "auth.json"), workAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-work",
+      email: "luca@talentware.com",
+      accountId: "acc_work",
+      refresh: "openai-refresh-work"
+    }
+  });
+
+  await assert.rejects(
+    () =>
+      runCli([
+        "--storage-dir",
+        storageDir,
+        "--codex-home",
+        codexHome,
+        "--opencode-data-dir",
+        opencodeDataDir,
+        "--provider",
+        "openai",
+        "save",
+        "luca"
+      ]),
+    /current auth email "luca@talentware\.com" does not match saved profile email "luca@example\.com"/
+  );
+});
+
+test("CLI save allows overwriting an existing openai profile when the email differs only by case", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "codex-switch-cli-"));
+  const storageDir = path.join(rootDir, "storage");
+  const codexHome = path.join(rootDir, "codex");
+  const opencodeDataDir = path.join(rootDir, "opencode");
+  await mkdir(codexHome, { recursive: true });
+  await mkdir(opencodeDataDir, { recursive: true });
+
+  const lowerCaseAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-lower",
+        refresh_token: "refresh-lower",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const mixedCaseAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "Luca@Example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-mixed",
+        refresh_token: "refresh-mixed",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), lowerCaseAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-lower",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-lower"
+    }
+  });
+  await runCli([
+    "--storage-dir",
+    storageDir,
+    "--codex-home",
+    codexHome,
+    "--opencode-data-dir",
+    opencodeDataDir,
+    "--provider",
+    "openai",
+    "save",
+    "luca"
+  ]);
+
+  await writeFile(path.join(codexHome, "auth.json"), mixedCaseAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-mixed",
+      email: "Luca@Example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-mixed"
+    }
+  });
+
+  await runCli([
+    "--storage-dir",
+    storageDir,
+    "--codex-home",
+    codexHome,
+    "--opencode-data-dir",
+    opencodeDataDir,
+    "--provider",
+    "openai",
+    "save",
+    "luca"
+  ]);
+});
+
+test("CLI save allows overwriting an existing openai profile when the current email is missing", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "codex-switch-cli-"));
+  const storageDir = path.join(rootDir, "storage");
+  const codexHome = path.join(rootDir, "codex");
+  const opencodeDataDir = path.join(rootDir, "opencode");
+  await mkdir(codexHome, { recursive: true });
+  await mkdir(opencodeDataDir, { recursive: true });
+
+  const oauthAuth = `${JSON.stringify(
+    {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: createIdToken({
+          email: "luca@example.com",
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc_personal"
+          }
+        }),
+        access_token: "access-oauth",
+        refresh_token: "refresh-oauth",
+        account_id: "acc_personal"
+      }
+    },
+    null,
+    2
+  )}\n`;
+  const apiKeyAuth = `${JSON.stringify(
+    {
+      auth_mode: "api_key",
+      OPENAI_API_KEY: "sk-test-work"
+    },
+    null,
+    2
+  )}\n`;
+
+  await writeFile(path.join(codexHome, "auth.json"), oauthAuth, "utf8");
+  await writeOpenCodeAccountFile(opencodeDataDir, {
+    openai: {
+      id: "openai-personal",
+      email: "luca@example.com",
+      accountId: "acc_personal",
+      refresh: "openai-refresh-personal"
+    }
+  });
+  await runCli([
+    "--storage-dir",
+    storageDir,
+    "--codex-home",
+    codexHome,
+    "--opencode-data-dir",
+    opencodeDataDir,
+    "--provider",
+    "openai",
+    "save",
+    "luca"
+  ]);
+
+  await writeFile(path.join(codexHome, "auth.json"), apiKeyAuth, "utf8");
+
+  await runCli([
+    "--storage-dir",
+    storageDir,
+    "--codex-home",
+    codexHome,
+    "--opencode-data-dir",
+    opencodeDataDir,
+    "--provider",
+    "openai",
+    "save",
+    "luca"
+  ]);
+});

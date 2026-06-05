@@ -70,6 +70,11 @@ export class CodexSwitch {
     this.assertRequiredSnapshots(provider, snapshots, "save");
 
     const state = await this.readState();
+    this.assertProfileIdentityMatch(
+      state.profiles[name]?.providers[provider] ?? null,
+      this.selectProfileMetadata(provider, snapshots),
+      `save profile "${name}"`
+    );
     const profile = this.buildProfileRecord(name, provider, snapshots, "save");
 
     await this.writeSavedSnapshots(name, provider, snapshots);
@@ -758,6 +763,12 @@ export class CodexSwitch {
       return null;
     }
 
+    this.assertProfileIdentityMatch(
+      state.profiles[name]?.providers[provider] ?? null,
+      this.selectProfileMetadata(provider, snapshots),
+      `sync profile "${name}"`
+    );
+
     const record = this.buildProfileRecord(name, provider, snapshots, "sync");
     await this.writeSavedSnapshots(name, provider, snapshots);
     state.profiles[name] = {
@@ -838,6 +849,27 @@ export class CodexSwitch {
       ? ["codex", "opencode-openai"]
       : ["opencode-opencode"];
   }
+
+  private assertProfileIdentityMatch(
+    existingProfile: ProfileRecord | null,
+    currentMetadata: CurrentAuthMetadata,
+    action: string
+  ): void {
+    if (!existingProfile) {
+      return;
+    }
+
+    const savedEmail = normalizeEmail(existingProfile.email);
+    const currentEmail = normalizeEmail(currentMetadata.email);
+
+    if (!savedEmail || !currentEmail || savedEmail === currentEmail) {
+      return;
+    }
+
+    throw new Error(
+      `Refusing to ${action}: current auth email "${currentMetadata.email}" does not match saved profile email "${existingProfile.email}"`
+    );
+  }
 }
 
 function isVersion2State(raw: unknown): raw is StateFile {
@@ -863,4 +895,8 @@ function validateProfileName(name: string): void {
 
 function failMissingRenamedProfile(): never {
   throw new Error("Renamed profile did not contain any provider data");
+}
+
+function normalizeEmail(email: string | null): string | null {
+  return typeof email === "string" && email.length > 0 ? email.trim().toLowerCase() : null;
 }
