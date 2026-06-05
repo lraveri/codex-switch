@@ -44,6 +44,15 @@ export function resolveDefaultCodexHome(): string {
   return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 }
 
+export function resolveDefaultOpenCodeDataDir(): string {
+  if (process.env.OPENCODE_DATA_DIR) {
+    return process.env.OPENCODE_DATA_DIR;
+  }
+
+  const xdgDataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  return path.join(xdgDataHome, "opencode");
+}
+
 export function sha256(content: Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }

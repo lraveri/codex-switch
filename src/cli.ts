@@ -1,11 +1,14 @@
 #!/usr/bin/env -S node
 
 import { CodexSwitch } from "./CodexSwitch.ts";
-import type { CurrentProfileResult, ProfileRecord } from "./types.ts";
+import type { CurrentProfileResult, ProfileRecord, SwitchProvider } from "./types.ts";
 
 interface CliOptions {
   storageDir?: string;
   codexHome?: string;
+  opencodeDataDir?: string;
+  provider: SwitchProvider;
+  providerProvided: boolean;
   json: boolean;
   help: boolean;
   version: boolean;
@@ -24,12 +27,19 @@ async function main(): Promise<void> {
     return;
   }
 
-  const managerOptions: { storageDir?: string; codexHome?: string } = {};
+  const managerOptions: {
+    storageDir?: string;
+    codexHome?: string;
+    opencodeDataDir?: string;
+  } = {};
   if (options.storageDir) {
     managerOptions.storageDir = options.storageDir;
   }
   if (options.codexHome) {
     managerOptions.codexHome = options.codexHome;
+  }
+  if (options.opencodeDataDir) {
+    managerOptions.opencodeDataDir = options.opencodeDataDir;
   }
 
   const manager = new CodexSwitch(managerOptions);
@@ -37,38 +47,46 @@ async function main(): Promise<void> {
   switch (command) {
     case "save": {
       const name = requirePositional(positionals, 0, "profile name");
-      const result = await manager.saveProfile(name);
-      printOutput(options.json, result, `Saved profile "${name}"`);
+      const result = await manager.saveProfile(name, options.provider);
+      printOutput(
+        options.json,
+        result,
+        `Saved profile "${name}" for provider "${options.provider}"`
+      );
       return;
     }
 
     case "load": {
       const name = requirePositional(positionals, 0, "profile name");
-      const result = await manager.loadProfile(name);
-      printOutput(options.json, result, `Loaded profile "${name}"`);
+      const result = await manager.loadProfile(name, options.provider);
+      printOutput(
+        options.json,
+        result,
+        `Loaded profile "${name}" for provider "${options.provider}"`
+      );
       return;
     }
 
     case "list": {
-      const profiles = await manager.listProfiles();
+      const profiles = await manager.listProfiles(options.provider);
       if (options.json) {
         printJson(profiles);
         return;
       }
 
       if (profiles.length === 0) {
-        console.log("No profiles saved");
+        console.log(`No profiles saved for provider "${options.provider}"`);
         return;
       }
 
-      const current = await manager.getCurrentProfile();
+      const current = await manager.getCurrentProfile(options.provider);
       printProfileList(profiles, current.activeProfile);
       return;
     }
 
     case "current": {
-      const current = await manager.getCurrentProfile();
-      const inSync = await manager.isActiveProfileInSync();
+      const current = await manager.getCurrentProfile(options.provider);
+      const inSync = await manager.isActiveProfileInSync(options.provider);
       const payload = { ...current, inSync };
 
       if (options.json) {
@@ -82,8 +100,12 @@ async function main(): Promise<void> {
 
     case "remove": {
       const name = requirePositional(positionals, 0, "profile name");
-      await manager.removeProfile(name);
-      console.log(`Removed profile "${name}"`);
+      await manager.removeProfile(name, options.providerProvided ? options.provider : undefined);
+      console.log(
+        options.providerProvided
+          ? `Removed provider "${options.provider}" from profile "${name}"`
+          : `Removed profile "${name}"`
+      );
       return;
     }
 
@@ -106,6 +128,8 @@ function parseArgv(argv: string[]): {
   positionals: string[];
 } {
   const options: CliOptions = {
+    provider: "openai",
+    providerProvided: false,
     json: false,
     help: false,
     version: false
@@ -143,6 +167,25 @@ function parseArgv(argv: string[]): {
 
     if (value === "--codex-home") {
       options.codexHome = requireOptionValue(argv, index, value);
+      index += 1;
+      continue;
+    }
+
+    if (value === "--opencode-data-dir") {
+      options.opencodeDataDir = requireOptionValue(argv, index, value);
+      index += 1;
+      continue;
+    }
+
+    if (value === "--provider") {
+      const provider = requireOptionValue(argv, index, value);
+
+      if (provider !== "openai" && provider !== "opencode") {
+        throw new Error(`Unsupported provider "${provider}". Use "openai" or "opencode"`);
+      }
+
+      options.provider = provider;
+      options.providerProvided = true;
       index += 1;
       continue;
     }
@@ -196,12 +239,14 @@ function printProfileList(profiles: ProfileRecord[], activeProfile: string | nul
     const marker = profile.name === activeProfile ? "*" : " ";
     const email = profile.email ?? "-";
     console.log(
-      `${marker} ${profile.name}\t${profile.authMode}\t${email}\t${profile.lastSavedAt}`
+      `${marker} ${profile.name}\t${profile.provider}\t${profile.authMode}\t${email}\t${profile.lastSavedAt}`
     );
   }
 }
 
 function printCurrent(current: CurrentProfileResult, inSync: boolean | null): void {
+  console.log(`Provider: ${current.provider}`);
+
   if (!current.activeProfile || !current.profile) {
     console.log("No active saved profile");
   } else {
@@ -221,6 +266,16 @@ function printCurrent(current: CurrentProfileResult, inSync: boolean | null): vo
   } else {
     console.log("Current auth file: not found");
   }
+
+  for (const [target, metadata] of Object.entries(current.currentAuths)) {
+    if (!metadata || target === current.currentAuth?.target) {
+      continue;
+    }
+
+    console.log(`${target} auth mode: ${metadata.authMode}`);
+    console.log(`${target} email: ${metadata.email ?? "-"}`);
+    console.log(`${target} account ID: ${metadata.accountId ?? "-"}`);
+  }
 }
 
 function printJson(value: unknown): void {
@@ -231,16 +286,18 @@ function printHelp(): void {
   console.log(`codex-switch
 
 Usage:
-  codex-switch save <profile>
-  codex-switch load <profile>
-  codex-switch list
-  codex-switch current
+  codex-switch save <profile> [--provider openai|opencode]
+  codex-switch load <profile> [--provider openai|opencode]
+  codex-switch list [--provider openai|opencode]
+  codex-switch current [--provider openai|opencode]
   codex-switch rename <from> <to>
-  codex-switch remove <profile>
+  codex-switch remove <profile> [--provider openai|opencode]
 
 Options:
   --storage-dir <path>
   --codex-home <path>
+  --opencode-data-dir <path>
+  --provider <openai|opencode>
   --json
   --help
   --version`);

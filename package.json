@@ -1,7 +1,7 @@
 {
   "name": "codex-switch",
   "version": "0.1.0",
-  "description": "CLI and library to switch between Codex auth.json profiles",
+  "description": "CLI and library to switch between Codex and OpenCode auth profiles",
   "type": "module",
   "bin": {
     "codex-switch": "./dist/cli.js"
@@ -30,6 +30,7 @@
   },
   "keywords": [
     "codex",
+    "opencode",
     "openai",
     "cli",
     "profiles",

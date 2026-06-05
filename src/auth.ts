@@ -7,7 +7,7 @@ interface JwtClaims {
   accountId: string | null;
 }
 
-export function parseAuthMetadata(content: string): CurrentAuthMetadata {
+export function parseCodexAuthMetadata(content: string): CurrentAuthMetadata {
   const parsed = JSON.parse(content) as Record<string, unknown>;
   const openAiApiKey = parsed.OPENAI_API_KEY;
   const tokens = parsed.tokens;
@@ -15,23 +15,82 @@ export function parseAuthMetadata(content: string): CurrentAuthMetadata {
   const tokenRecord = isRecord(tokens) ? tokens : null;
   const idToken =
     tokenRecord && typeof tokenRecord.id_token === "string" ? tokenRecord.id_token : null;
-  const jwtClaims = idToken ? parseJwtClaims(idToken) : { email: null, accountId: null };
+  const jwtClaims = idToken ? parseCodexJwtClaims(idToken) : { email: null, accountId: null };
   const accountIdFromTokens =
     tokenRecord && typeof tokenRecord.account_id === "string" ? tokenRecord.account_id : null;
   const hasApiKey = typeof openAiApiKey === "string" && openAiApiKey.length > 0;
   const hasTokens = tokenRecord !== null;
 
   return {
-    authMode: detectAuthMode(rawAuthMode, hasApiKey, hasTokens),
+    authMode: detectCodexAuthMode(rawAuthMode, hasApiKey, hasTokens),
     email: jwtClaims.email,
     accountId: jwtClaims.accountId ?? accountIdFromTokens,
     hasApiKey,
     hasTokens,
-    rawAuthMode
+    rawAuthMode,
+    target: "codex"
   };
 }
 
-function detectAuthMode(
+export function parseOpenAiAccessTokenClaims(token: string): JwtClaims {
+  const payload = parseJwtPayload(token);
+
+  if (!payload) {
+    return { email: null, accountId: null };
+  }
+
+  const authClaims = isRecord(payload["https://api.openai.com/auth"])
+    ? payload["https://api.openai.com/auth"]
+    : null;
+  const profileClaims = isRecord(payload["https://api.openai.com/profile"])
+    ? payload["https://api.openai.com/profile"]
+    : null;
+
+  return {
+    email: profileClaims && typeof profileClaims.email === "string" ? profileClaims.email : null,
+    accountId:
+      authClaims && typeof authClaims.chatgpt_account_id === "string"
+        ? authClaims.chatgpt_account_id
+        : null
+  };
+}
+
+export function createApiKeyMetadata(
+  rawAuthMode: string | null,
+  target: CurrentAuthMetadata["target"],
+  serviceId?: string
+): CurrentAuthMetadata {
+  return {
+    authMode: "api_key",
+    email: null,
+    accountId: null,
+    hasApiKey: true,
+    hasTokens: false,
+    rawAuthMode,
+    ...(serviceId ? { serviceId } : {}),
+    ...(target ? { target } : {})
+  };
+}
+
+export function createOauthMetadata(
+  rawAuthMode: string | null,
+  claims: JwtClaims,
+  target: CurrentAuthMetadata["target"],
+  serviceId?: string
+): CurrentAuthMetadata {
+  return {
+    authMode: "oauth",
+    email: claims.email,
+    accountId: claims.accountId,
+    hasApiKey: false,
+    hasTokens: true,
+    rawAuthMode,
+    ...(serviceId ? { serviceId } : {}),
+    ...(target ? { target } : {})
+  };
+}
+
+function detectCodexAuthMode(
   rawAuthMode: string | null,
   hasApiKey: boolean,
   hasTokens: boolean
@@ -51,30 +110,40 @@ function detectAuthMode(
   return "unknown";
 }
 
-function parseJwtClaims(token: string): JwtClaims {
-  const parts = token.split(".");
-  const payload = parts[1];
+function parseCodexJwtClaims(token: string): JwtClaims {
+  const payload = parseJwtPayload(token);
 
   if (!payload) {
     return { email: null, accountId: null };
   }
 
+  const authClaims = isRecord(payload["https://api.openai.com/auth"])
+    ? payload["https://api.openai.com/auth"]
+    : null;
+
+  return {
+    email: typeof payload.email === "string" ? payload.email : null,
+    accountId:
+      authClaims && typeof authClaims.chatgpt_account_id === "string"
+        ? authClaims.chatgpt_account_id
+        : null
+  };
+}
+
+function parseJwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split(".");
+  const payload = parts[1];
+
+  if (!payload) {
+    return null;
+  }
+
   try {
     const decoded = Buffer.from(normalizeBase64Url(payload), "base64").toString("utf8");
     const parsed = JSON.parse(decoded) as Record<string, unknown>;
-    const authClaims = isRecord(parsed["https://api.openai.com/auth"])
-      ? parsed["https://api.openai.com/auth"]
-      : null;
-
-    return {
-      email: typeof parsed.email === "string" ? parsed.email : null,
-      accountId:
-        authClaims && typeof authClaims.chatgpt_account_id === "string"
-          ? authClaims.chatgpt_account_id
-          : null
-    };
+    return isRecord(parsed) ? parsed : null;
   } catch {
-    return { email: null, accountId: null };
+    return null;
   }
 }
 

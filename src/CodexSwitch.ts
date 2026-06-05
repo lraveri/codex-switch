@@ -1,118 +1,164 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { parseAuthMetadata } from "./auth.ts";
+import { parseCodexAuthMetadata } from "./auth.ts";
 import {
   ensureDir,
   fileExists,
   readJsonFile,
   resolveDefaultCodexHome,
+  resolveDefaultOpenCodeDataDir,
   resolveDefaultStorageDir,
   sha256,
   writeFileAtomic,
   writeJsonAtomic
 } from "./fs.ts";
+import {
+  emptyOpenCodeAccountFile,
+  getActiveOpenCodeAccount,
+  normalizeOpenCodeAccountFile,
+  parseOpenCodeAccountInfoMetadata,
+  parseOpenCodeAccountMetadata,
+  upsertActiveOpenCodeAccount,
+  type OpenCodeAccountFile,
+  type OpenCodeAccountInfo
+} from "./opencode.ts";
 import type {
+  AuthTarget,
   CodexSwitchOptions,
   CurrentAuthMetadata,
   CurrentProfileResult,
+  LegacyStateFile,
   LoadProfileResult,
   ProfileRecord,
   SaveProfileResult,
-  StateFile
+  SavedProfileEntry,
+  StateFile,
+  SwitchProvider
 } from "./types.ts";
 
-const STATE_VERSION = 1 as const;
+const STATE_VERSION = 2 as const;
+
+interface LiveSnapshot {
+  target: AuthTarget;
+  content: Buffer;
+  metadata: CurrentAuthMetadata;
+}
+
+type SnapshotMap = Partial<Record<AuthTarget, LiveSnapshot>>;
 
 export class CodexSwitch {
   readonly storageDir: string;
   readonly codexHome: string;
+  readonly opencodeDataDir: string;
 
   constructor(options: CodexSwitchOptions = {}) {
     this.storageDir = path.resolve(options.storageDir ?? resolveDefaultStorageDir());
     this.codexHome = path.resolve(options.codexHome ?? resolveDefaultCodexHome());
+    this.opencodeDataDir = path.resolve(
+      options.opencodeDataDir ?? resolveDefaultOpenCodeDataDir()
+    );
   }
 
-  async saveProfile(name: string): Promise<SaveProfileResult> {
+  async saveProfile(
+    name: string,
+    provider: SwitchProvider = "openai"
+  ): Promise<SaveProfileResult> {
     validateProfileName(name);
 
-    const authPath = this.getCodexAuthPath();
-    const authContent = await this.readCurrentAuthBytes();
-    const metadata = this.buildProfileRecord(name, authContent, "save");
-    const state = await this.readState();
-
-    await writeFileAtomic(metadata.authFilePath, authContent);
-    state.profiles[name] = metadata;
-    state.activeProfile = name;
-    await this.writeState(state);
-
-    return { profile: metadata, authFilePath: authPath };
-  }
-
-  async loadProfile(name: string): Promise<LoadProfileResult> {
-    validateProfileName(name);
+    const snapshots = await this.readCurrentSnapshots(provider);
+    this.assertRequiredSnapshots(provider, snapshots, "save");
 
     const state = await this.readState();
-    const targetPath = this.getProfileAuthPath(name);
+    const profile = this.buildProfileRecord(name, provider, snapshots, "save");
 
-    if (!(await fileExists(targetPath))) {
-      throw new Error(`Profile "${name}" does not exist`);
-    }
-
-    const targetContent = await fs.readFile(targetPath);
-    let syncedProfile: ProfileRecord | null = null;
-
-    const currentProfileName = await this.resolveCurrentProfileName(state, name);
-
-    if (currentProfileName && currentProfileName !== name) {
-      const currentAuthPath = this.getCodexAuthPath();
-      if (await fileExists(currentAuthPath)) {
-        const currentContent = await fs.readFile(currentAuthPath);
-        syncedProfile = this.buildProfileRecord(currentProfileName, currentContent, "sync");
-        await writeFileAtomic(syncedProfile.authFilePath, currentContent);
-        state.profiles[currentProfileName] = syncedProfile;
+    await this.writeSavedSnapshots(name, provider, snapshots);
+    state.profiles[name] = {
+      name,
+      providers: {
+        ...(state.profiles[name]?.providers ?? {}),
+        [provider]: profile
       }
-    }
-
-    await ensureDir(this.codexHome);
-    await writeFileAtomic(this.getCodexAuthPath(), targetContent);
-
-    const targetProfile =
-      state.profiles[name] ?? this.buildProfileRecord(name, targetContent, "save");
-    state.profiles[name] = targetProfile;
-    state.activeProfile = name;
+    };
+    state.activeProfiles[provider] = name;
     await this.writeState(state);
 
     return {
+      provider,
+      profile,
+      authFilePath: profile.authFilePath,
+      authFilePaths: profile.authFilePaths
+    };
+  }
+
+  async loadProfile(
+    name: string,
+    provider: SwitchProvider = "openai"
+  ): Promise<LoadProfileResult> {
+    validateProfileName(name);
+
+    const state = await this.readState();
+    const targetProfile = state.profiles[name]?.providers[provider];
+
+    if (!targetProfile) {
+      throw new Error(`Profile "${name}" does not exist for provider "${provider}"`);
+    }
+
+    await this.assertSavedProfileExists(targetProfile);
+
+    let syncedProfile: ProfileRecord | null = null;
+    const currentProfileName = await this.resolveCurrentProfileName(state, provider, name);
+
+    if (currentProfileName && currentProfileName !== name) {
+      syncedProfile = await this.syncProfileFromCurrent(state, currentProfileName, provider);
+    }
+
+    await this.restoreSavedProfile(targetProfile);
+    state.activeProfiles[provider] = name;
+    await this.writeState(state);
+
+    return {
+      provider,
       profile: targetProfile,
-      authFilePath: this.getCodexAuthPath(),
+      authFilePath: targetProfile.authFilePath,
+      authFilePaths: targetProfile.authFilePaths,
       syncedProfile
     };
   }
 
-  async listProfiles(): Promise<ProfileRecord[]> {
+  async listProfiles(provider: SwitchProvider = "openai"): Promise<ProfileRecord[]> {
     const state = await this.readState();
 
-    return Object.values(state.profiles).sort((left, right) =>
-      left.name.localeCompare(right.name)
-    );
+    return Object.values(state.profiles)
+      .map((profile) => profile.providers[provider] ?? null)
+      .filter((profile): profile is ProfileRecord => profile !== null)
+      .sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  async getCurrentProfile(): Promise<CurrentProfileResult> {
+  async getCurrentProfile(provider: SwitchProvider = "openai"): Promise<CurrentProfileResult> {
     const state = await this.readState();
-    const currentAuthPath = this.getCodexAuthPath();
-    const currentAuth = await this.readCurrentAuthMetadata();
-    const profile = state.activeProfile ? state.profiles[state.activeProfile] ?? null : null;
+    const currentAuthPaths = this.getCurrentAuthPaths(provider);
+    const currentSnapshots = await this.readCurrentSnapshots(provider);
+    const primaryTarget = this.selectPrimaryCurrentTarget(provider, currentSnapshots);
+    const profileName = state.activeProfiles[provider];
+    const profile = profileName ? state.profiles[profileName]?.providers[provider] ?? null : null;
 
     return {
-      activeProfile: state.activeProfile,
+      provider,
+      activeProfile: profileName,
       profile,
-      currentAuthPath,
-      currentAuth
+      currentAuthPath: primaryTarget
+        ? currentAuthPaths[primaryTarget] ?? this.getDefaultCurrentAuthPath(provider)
+        : this.getDefaultCurrentAuthPath(provider),
+      currentAuth: primaryTarget ? currentSnapshots[primaryTarget]?.metadata ?? null : null,
+      currentAuthPaths,
+      currentAuths: Object.fromEntries(
+        Object.values(currentSnapshots).map((snapshot) => [snapshot.target, snapshot.metadata])
+      ) as Partial<Record<AuthTarget, CurrentAuthMetadata>>
     };
   }
 
-  async removeProfile(name: string): Promise<void> {
+  async removeProfile(name: string, provider?: SwitchProvider): Promise<void> {
     validateProfileName(name);
 
     const state = await this.readState();
@@ -122,11 +168,34 @@ export class CodexSwitch {
       throw new Error(`Profile "${name}" does not exist`);
     }
 
-    await fs.rm(path.dirname(profile.authFilePath), { recursive: true, force: true });
-    delete state.profiles[name];
+    if (!provider) {
+      await fs.rm(path.join(this.getProfilesDir(), name), { recursive: true, force: true });
+      delete state.profiles[name];
 
-    if (state.activeProfile === name) {
-      state.activeProfile = null;
+      for (const key of Object.keys(state.activeProfiles) as SwitchProvider[]) {
+        if (state.activeProfiles[key] === name) {
+          state.activeProfiles[key] = null;
+        }
+      }
+
+      await this.writeState(state);
+      return;
+    }
+
+    if (!profile.providers[provider]) {
+      throw new Error(`Profile "${name}" does not exist for provider "${provider}"`);
+    }
+
+    await fs.rm(this.getProviderProfileDir(name, provider), { recursive: true, force: true });
+    delete profile.providers[provider];
+
+    if (state.activeProfiles[provider] === name) {
+      state.activeProfiles[provider] = null;
+    }
+
+    if (Object.keys(profile.providers).length === 0) {
+      delete state.profiles[name];
+      await fs.rm(path.join(this.getProfilesDir(), name), { recursive: true, force: true });
     }
 
     await this.writeState(state);
@@ -147,192 +216,641 @@ export class CodexSwitch {
       throw new Error(`Profile "${fromName}" does not exist`);
     }
 
-    if (state.profiles[toName] || (await fileExists(this.getProfileAuthPath(toName)))) {
+    if (state.profiles[toName] || (await fileExists(path.join(this.getProfilesDir(), toName)))) {
       throw new Error(`Profile "${toName}" already exists`);
     }
 
-    const sourceDir = path.dirname(source.authFilePath);
-    const targetDir = path.join(this.getProfilesDir(), toName);
     await ensureDir(this.getProfilesDir());
-    await fs.rename(sourceDir, targetDir);
+    await fs.rename(path.join(this.getProfilesDir(), fromName), path.join(this.getProfilesDir(), toName));
 
-    const renamed: ProfileRecord = {
-      ...source,
+    const renamed: SavedProfileEntry = {
       name: toName,
-      authFilePath: path.join(targetDir, "auth.json")
+      providers: {}
     };
+
+    for (const provider of Object.keys(source.providers) as SwitchProvider[]) {
+      const existing = source.providers[provider];
+
+      if (!existing) {
+        continue;
+      }
+
+      renamed.providers[provider] = {
+        ...existing,
+        name: toName,
+        authFilePath: this.getPrimarySavedAuthPath(toName, provider),
+        authFilePaths: this.buildSavedAuthFilePaths(toName, provider, existing.authFilePaths)
+      };
+    }
 
     delete state.profiles[fromName];
     state.profiles[toName] = renamed;
 
-    if (state.activeProfile === fromName) {
-      state.activeProfile = toName;
+    for (const provider of Object.keys(state.activeProfiles) as SwitchProvider[]) {
+      if (state.activeProfiles[provider] === fromName) {
+        state.activeProfiles[provider] = toName;
+      }
     }
 
     await this.writeState(state);
-    return renamed;
+
+    return renamed.providers.openai ?? renamed.providers.opencode ?? failMissingRenamedProfile();
   }
 
-  private async readCurrentAuthBytes(): Promise<Buffer> {
-    const authPath = this.getCodexAuthPath();
+  async isActiveProfileInSync(provider: SwitchProvider = "openai"): Promise<boolean | null> {
+    const state = await this.readState();
+    const profileName = state.activeProfiles[provider];
 
-    if (!(await fileExists(authPath))) {
-      throw new Error(`Current Codex auth file not found at ${authPath}`);
+    if (!profileName) {
+      return null;
     }
 
-    return fs.readFile(authPath);
-  }
+    const profile = state.profiles[profileName]?.providers[provider];
 
-  private async readCurrentAuthMetadata(): Promise<CurrentAuthMetadata | null> {
-    try {
-      const content = await this.readCurrentAuthBytes();
-      return parseAuthMetadata(content.toString("utf8"));
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        throw new Error(`Invalid JSON in current Codex auth file at ${this.getCodexAuthPath()}`);
+    if (!profile) {
+      return false;
+    }
+
+    const currentSnapshots = await this.readCurrentSnapshots(provider);
+
+    for (const target of Object.keys(profile.authFilePaths) as AuthTarget[]) {
+      const savedPath = profile.authFilePaths[target];
+      const currentSnapshot = currentSnapshots[target];
+
+      if (!savedPath || !currentSnapshot || !(await fileExists(savedPath))) {
+        return false;
       }
 
-      if (error instanceof Error && error.message.startsWith("Current Codex auth file not found")) {
-        return null;
+      const savedContent = await fs.readFile(savedPath);
+
+      if (sha256(savedContent) !== sha256(currentSnapshot.content)) {
+        return false;
       }
-
-      throw error;
-    }
-  }
-
-  private async readState(): Promise<StateFile> {
-    const statePath = this.getStatePath();
-
-    if (!(await fileExists(statePath))) {
-      return {
-        version: STATE_VERSION,
-        activeProfile: null,
-        profiles: {}
-      };
     }
 
-    const state = await readJsonFile<StateFile>(statePath);
-
-    return {
-      version: STATE_VERSION,
-      activeProfile: state.activeProfile ?? null,
-      profiles: state.profiles ?? {}
-    };
-  }
-
-  private async writeState(state: StateFile): Promise<void> {
-    await writeJsonAtomic(this.getStatePath(), state);
-  }
-
-  private buildProfileRecord(
-    name: string,
-    authContent: Buffer,
-    source: "save" | "sync"
-  ): ProfileRecord {
-    const metadata = parseAuthMetadata(authContent.toString("utf8"));
-
-    return {
-      name,
-      authMode: metadata.authMode,
-      email: metadata.email,
-      accountId: metadata.accountId,
-      lastSavedAt: new Date().toISOString(),
-      source,
-      authFilePath: this.getProfileAuthPath(name)
-    };
+    return true;
   }
 
   getCodexAuthPath(): string {
     return path.join(this.codexHome, "auth.json");
   }
 
-  getProfilesDir(): string {
-    return path.join(this.storageDir, "profiles");
+  getOpenCodeAccountPath(): string {
+    return path.join(this.opencodeDataDir, "account.json");
   }
 
-  getProfileAuthPath(name: string): string {
-    return path.join(this.getProfilesDir(), name, "auth.json");
+  getProfilesDir(): string {
+    return path.join(this.storageDir, "profiles");
   }
 
   getStatePath(): string {
     return path.join(this.storageDir, "state.json");
   }
 
-  async isActiveProfileInSync(): Promise<boolean | null> {
-    const state = await this.readState();
+  getProfileAuthPath(name: string, provider: SwitchProvider = "openai"): string {
+    return this.getPrimarySavedAuthPath(name, provider);
+  }
 
-    if (!state.activeProfile) {
+  private getProviderProfileDir(name: string, provider: SwitchProvider): string {
+    return path.join(this.getProfilesDir(), name, provider);
+  }
+
+  private getSavedCodexAuthPath(name: string): string {
+    return path.join(this.getProviderProfileDir(name, "openai"), "codex-auth.json");
+  }
+
+  private getSavedOpenCodeAccountPath(name: string, provider: SwitchProvider): string {
+    return path.join(this.getProviderProfileDir(name, provider), "opencode-account.json");
+  }
+
+  private getPrimarySavedAuthPath(name: string, provider: SwitchProvider): string {
+    return provider === "openai"
+      ? this.getSavedCodexAuthPath(name)
+      : this.getSavedOpenCodeAccountPath(name, provider);
+  }
+
+  private getDefaultCurrentAuthPath(provider: SwitchProvider): string {
+    return provider === "openai" ? this.getCodexAuthPath() : this.getOpenCodeAccountPath();
+  }
+
+  private getCurrentAuthPaths(provider: SwitchProvider): Partial<Record<AuthTarget, string>> {
+    if (provider === "openai") {
+      return {
+        codex: this.getCodexAuthPath(),
+        "opencode-openai": this.getOpenCodeAccountPath()
+      };
+    }
+
+    return {
+      "opencode-opencode": this.getOpenCodeAccountPath()
+    };
+  }
+
+  private buildSavedAuthFilePaths(
+    name: string,
+    provider: SwitchProvider,
+    authFilePaths: Partial<Record<AuthTarget, string>>
+  ): Partial<Record<AuthTarget, string>> {
+    const next: Partial<Record<AuthTarget, string>> = {};
+
+    for (const target of Object.keys(authFilePaths) as AuthTarget[]) {
+      if (target === "codex") {
+        next[target] = this.getSavedCodexAuthPath(name);
+        continue;
+      }
+
+      next[target] = this.getSavedOpenCodeAccountPath(name, provider);
+    }
+
+    return next;
+  }
+
+  private async readCurrentSnapshots(provider: SwitchProvider): Promise<SnapshotMap> {
+    if (provider === "openai") {
+      const [codexSnapshot, openaiSnapshot] = await Promise.all([
+        this.tryReadCurrentCodexSnapshot(),
+        this.tryReadCurrentOpenCodeSnapshot("openai")
+      ]);
+
+      return {
+        ...(codexSnapshot ? { codex: codexSnapshot } : {}),
+        ...(openaiSnapshot ? { "opencode-openai": openaiSnapshot } : {})
+      };
+    }
+
+    const opencodeSnapshot = await this.tryReadCurrentOpenCodeSnapshot("opencode");
+
+    return {
+      ...(opencodeSnapshot ? { "opencode-opencode": opencodeSnapshot } : {})
+    };
+  }
+
+  private async tryReadCurrentCodexSnapshot(): Promise<LiveSnapshot | null> {
+    const authPath = this.getCodexAuthPath();
+
+    if (!(await fileExists(authPath))) {
       return null;
     }
 
-    const profile = state.profiles[state.activeProfile];
-    if (!profile) {
-      return false;
+    const content = await fs.readFile(authPath);
+
+    try {
+      return {
+        target: "codex",
+        content,
+        metadata: parseCodexAuthMetadata(content.toString("utf8"))
+      };
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new Error(`Invalid JSON in current Codex auth file at ${authPath}`);
+      }
+
+      throw error;
+    }
+  }
+
+  private async tryReadCurrentOpenCodeSnapshot(serviceID: "openai" | "opencode"): Promise<LiveSnapshot | null> {
+    const accountFile = await this.readCurrentOpenCodeAccountFile();
+    const account = getActiveOpenCodeAccount(accountFile, serviceID);
+
+    if (!account) {
+      return null;
     }
 
-    const currentAuthPath = this.getCodexAuthPath();
-    if (!(await fileExists(currentAuthPath)) || !(await fileExists(profile.authFilePath))) {
-      return false;
+    const content = Buffer.from(`${JSON.stringify(account, null, 2)}\n`, "utf8");
+
+    return {
+      target: serviceID === "openai" ? "opencode-openai" : "opencode-opencode",
+      content,
+      metadata: parseOpenCodeAccountInfoMetadata(account)
+    };
+  }
+
+  private async readCurrentOpenCodeAccountFile(): Promise<OpenCodeAccountFile> {
+    const accountPath = this.getOpenCodeAccountPath();
+
+    if (!(await fileExists(accountPath))) {
+      return emptyOpenCodeAccountFile();
     }
 
-    const [currentContent, savedContent] = await Promise.all([
-      fs.readFile(currentAuthPath),
-      fs.readFile(profile.authFilePath)
-    ]);
+    try {
+      const raw = await readJsonFile<unknown>(accountPath);
+      return normalizeOpenCodeAccountFile(raw);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new Error(`Invalid JSON in current OpenCode account file at ${accountPath}`);
+      }
 
-    return sha256(currentContent) === sha256(savedContent);
+      throw error;
+    }
+  }
+
+  private async writeCurrentOpenCodeAccountFile(accountFile: OpenCodeAccountFile): Promise<void> {
+    await writeJsonAtomic(this.getOpenCodeAccountPath(), accountFile);
+  }
+
+  private assertRequiredSnapshots(
+    provider: SwitchProvider,
+    snapshots: SnapshotMap,
+    action: "save" | "sync"
+  ): void {
+    if (provider === "openai" && !snapshots.codex) {
+      throw new Error(`Current Codex auth file not found at ${this.getCodexAuthPath()}`);
+    }
+
+    if (provider === "opencode" && !snapshots["opencode-opencode"]) {
+      const label = action === "save" ? "save" : "sync";
+      throw new Error(
+        `Current OpenCode account for provider "opencode" not found at ${this.getOpenCodeAccountPath()} during ${label}`
+      );
+    }
+  }
+
+  private buildProfileRecord(
+    name: string,
+    provider: SwitchProvider,
+    snapshots: SnapshotMap,
+    source: "save" | "sync"
+  ): ProfileRecord {
+    const metadata = this.selectProfileMetadata(provider, snapshots);
+    const authFilePaths: Partial<Record<AuthTarget, string>> = {};
+
+    for (const target of Object.keys(snapshots) as AuthTarget[]) {
+      if (target === "codex") {
+        authFilePaths[target] = this.getSavedCodexAuthPath(name);
+        continue;
+      }
+
+      authFilePaths[target] = this.getSavedOpenCodeAccountPath(name, provider);
+    }
+
+    return {
+      name,
+      provider,
+      authMode: metadata.authMode,
+      email: metadata.email,
+      accountId: metadata.accountId,
+      lastSavedAt: new Date().toISOString(),
+      source,
+      authFilePath: this.selectPrimarySavedPath(name, provider, authFilePaths),
+      authFilePaths
+    };
+  }
+
+  private selectProfileMetadata(provider: SwitchProvider, snapshots: SnapshotMap): CurrentAuthMetadata {
+    if (provider === "openai") {
+      return (
+        snapshots.codex?.metadata ??
+        snapshots["opencode-openai"]?.metadata ?? {
+          authMode: "unknown",
+          email: null,
+          accountId: null,
+          hasApiKey: false,
+          hasTokens: false,
+          rawAuthMode: null
+        }
+      );
+    }
+
+    return (
+      snapshots["opencode-opencode"]?.metadata ?? {
+        authMode: "unknown",
+        email: null,
+        accountId: null,
+        hasApiKey: false,
+        hasTokens: false,
+        rawAuthMode: null
+      }
+    );
+  }
+
+  private selectPrimarySavedPath(
+    name: string,
+    provider: SwitchProvider,
+    authFilePaths: Partial<Record<AuthTarget, string>>
+  ): string {
+    if (provider === "openai") {
+      return authFilePaths.codex ?? authFilePaths["opencode-openai"] ?? this.getSavedCodexAuthPath(name);
+    }
+
+    return authFilePaths["opencode-opencode"] ?? this.getSavedOpenCodeAccountPath(name, "opencode");
+  }
+
+  private selectPrimaryCurrentTarget(
+    provider: SwitchProvider,
+    snapshots: SnapshotMap
+  ): AuthTarget | null {
+    if (provider === "openai") {
+      return snapshots.codex ? "codex" : snapshots["opencode-openai"] ? "opencode-openai" : null;
+    }
+
+    return snapshots["opencode-opencode"] ? "opencode-opencode" : null;
+  }
+
+  private async writeSavedSnapshots(
+    name: string,
+    provider: SwitchProvider,
+    snapshots: SnapshotMap
+  ): Promise<void> {
+    if (snapshots.codex) {
+      await writeFileAtomic(this.getSavedCodexAuthPath(name), snapshots.codex.content);
+    }
+
+    if (provider === "openai" && snapshots["opencode-openai"]) {
+      await writeFileAtomic(
+        this.getSavedOpenCodeAccountPath(name, provider),
+        snapshots["opencode-openai"].content
+      );
+    }
+
+    if (provider === "opencode" && snapshots["opencode-opencode"]) {
+      await writeFileAtomic(
+        this.getSavedOpenCodeAccountPath(name, provider),
+        snapshots["opencode-opencode"].content
+      );
+    }
+  }
+
+  private async assertSavedProfileExists(profile: ProfileRecord): Promise<void> {
+    if (Object.keys(profile.authFilePaths).length === 0) {
+      throw new Error(`Profile "${profile.name}" does not have any saved auth snapshots`);
+    }
+
+    for (const savedPath of Object.values(profile.authFilePaths)) {
+      if (!savedPath || !(await fileExists(savedPath))) {
+        throw new Error(`Profile "${profile.name}" is missing saved auth file at ${savedPath}`);
+      }
+    }
+  }
+
+  private async restoreSavedProfile(profile: ProfileRecord): Promise<void> {
+    if (profile.authFilePaths.codex) {
+      await ensureDir(this.codexHome);
+      await writeFileAtomic(this.getCodexAuthPath(), await fs.readFile(profile.authFilePaths.codex));
+    }
+
+    if (profile.provider === "openai" && profile.authFilePaths["opencode-openai"]) {
+      await this.restoreSavedOpenCodeAccount(profile.authFilePaths["opencode-openai"]);
+    }
+
+    if (profile.provider === "opencode" && profile.authFilePaths["opencode-opencode"]) {
+      await this.restoreSavedOpenCodeAccount(profile.authFilePaths["opencode-opencode"]);
+    }
+  }
+
+  private async restoreSavedOpenCodeAccount(savedPath: string): Promise<void> {
+    const savedContent = await fs.readFile(savedPath, "utf8");
+    const savedMetadata = parseOpenCodeAccountMetadata(savedContent);
+
+    if (!savedMetadata.serviceId) {
+      throw new Error(`Saved OpenCode account file at ${savedPath} does not contain a service ID`);
+    }
+
+    const savedAccount = normalizeOpenCodeAccountFile({
+      version: 2,
+      accounts: {
+        temp: JSON.parse(savedContent) as unknown
+      },
+      active: {
+        [savedMetadata.serviceId]: "temp"
+      }
+    });
+    const account = getActiveOpenCodeAccount(savedAccount, savedMetadata.serviceId);
+
+    if (!account) {
+      throw new Error(`Saved OpenCode account file at ${savedPath} is invalid`);
+    }
+
+    const currentAccountFile = await this.readCurrentOpenCodeAccountFile();
+    const next = upsertActiveOpenCodeAccount(currentAccountFile, account);
+    await this.writeCurrentOpenCodeAccountFile(next);
+  }
+
+  private async readState(): Promise<StateFile> {
+    const statePath = this.getStatePath();
+
+    if (!(await fileExists(statePath))) {
+      return this.createEmptyState();
+    }
+
+    const raw = await readJsonFile<unknown>(statePath);
+    return this.normalizeState(raw);
+  }
+
+  private async writeState(state: StateFile): Promise<void> {
+    await writeJsonAtomic(this.getStatePath(), state);
+  }
+
+  private createEmptyState(): StateFile {
+    return {
+      version: STATE_VERSION,
+      activeProfiles: {
+        openai: null,
+        opencode: null
+      },
+      profiles: {}
+    };
+  }
+
+  private normalizeState(raw: unknown): StateFile {
+    if (isVersion2State(raw)) {
+      return {
+        version: STATE_VERSION,
+        activeProfiles: {
+          openai: raw.activeProfiles.openai ?? null,
+          opencode: raw.activeProfiles.opencode ?? null
+        },
+        profiles: Object.fromEntries(
+          Object.entries(raw.profiles).map(([name, profile]) => [name, this.normalizeSavedProfileEntry(profile)])
+        )
+      };
+    }
+
+    const legacy = (raw ?? {}) as LegacyStateFile;
+    const state = this.createEmptyState();
+    state.activeProfiles.openai = legacy.activeProfile ?? null;
+
+    for (const [name, profile] of Object.entries(legacy.profiles ?? {})) {
+      state.profiles[name] = {
+        name,
+        providers: {
+          openai: {
+            name,
+            provider: "openai",
+            authMode: profile.authMode,
+            email: profile.email,
+            accountId: profile.accountId,
+            lastSavedAt: profile.lastSavedAt,
+            source: profile.source,
+            authFilePath: profile.authFilePath,
+            authFilePaths: {
+              codex: profile.authFilePath
+            }
+          }
+        }
+      };
+    }
+
+    return state;
+  }
+
+  private normalizeSavedProfileEntry(raw: SavedProfileEntry): SavedProfileEntry {
+    const name = typeof raw?.name === "string" ? raw.name : "";
+    const providers = isRecord(raw?.providers) ? raw.providers : {};
+    const next: SavedProfileEntry = {
+      name,
+      providers: {}
+    };
+
+    for (const provider of ["openai", "opencode"] as const) {
+      const value = providers[provider];
+
+      if (!isRecord(value)) {
+        continue;
+      }
+
+      const authFilePaths = isRecord(value.authFilePaths) ? value.authFilePaths : {};
+      const normalizedAuthFilePaths: Partial<Record<AuthTarget, string>> = {};
+
+      for (const target of ["codex", "opencode-openai", "opencode-opencode"] as const) {
+        const savedPath = authFilePaths[target];
+        if (typeof savedPath === "string") {
+          normalizedAuthFilePaths[target] = savedPath;
+        }
+      }
+
+      next.providers[provider] = {
+        name: typeof value.name === "string" ? value.name : name,
+        provider,
+        authMode: typeof value.authMode === "string" ? value.authMode : "unknown",
+        email: typeof value.email === "string" ? value.email : null,
+        accountId: typeof value.accountId === "string" ? value.accountId : null,
+        lastSavedAt:
+          typeof value.lastSavedAt === "string" ? value.lastSavedAt : new Date(0).toISOString(),
+        source: value.source === "sync" ? "sync" : "save",
+        authFilePath:
+          typeof value.authFilePath === "string"
+            ? value.authFilePath
+            : this.getPrimarySavedAuthPath(
+                name || (typeof value.name === "string" ? value.name : "unknown"),
+                provider,
+                normalizedAuthFilePaths
+              ),
+        authFilePaths: normalizedAuthFilePaths
+      };
+    }
+
+    return next;
+  }
+
+  private async syncProfileFromCurrent(
+    state: StateFile,
+    name: string,
+    provider: SwitchProvider
+  ): Promise<ProfileRecord | null> {
+    const snapshots = await this.readCurrentSnapshots(provider);
+
+    if (provider === "openai" && !snapshots.codex && !snapshots["opencode-openai"]) {
+      return null;
+    }
+
+    if (provider === "opencode" && !snapshots["opencode-opencode"]) {
+      return null;
+    }
+
+    const record = this.buildProfileRecord(name, provider, snapshots, "sync");
+    await this.writeSavedSnapshots(name, provider, snapshots);
+    state.profiles[name] = {
+      name,
+      providers: {
+        ...(state.profiles[name]?.providers ?? {}),
+        [provider]: record
+      }
+    };
+    await this.writeState(state);
+    return record;
   }
 
   private async resolveCurrentProfileName(
     state: StateFile,
+    provider: SwitchProvider,
     targetProfileName: string
   ): Promise<string | null> {
-    const currentAuthPath = this.getCodexAuthPath();
-    if (!(await fileExists(currentAuthPath))) {
-      return state.activeProfile;
-    }
+    const currentSnapshots = await this.readCurrentSnapshots(provider);
+    const otherProfiles = Object.values(state.profiles)
+      .map((profile) => profile.providers[provider] ?? null)
+      .filter(
+        (profile): profile is ProfileRecord =>
+          profile !== null && profile.name !== targetProfileName
+      );
 
-    const currentContent = await fs.readFile(currentAuthPath);
-    const currentHash = sha256(currentContent);
+    for (const target of this.getTargetOrder(provider)) {
+      const currentSnapshot = currentSnapshots[target];
 
-    for (const profile of Object.values(state.profiles)) {
-      if (profile.name === targetProfileName) {
+      if (!currentSnapshot) {
         continue;
       }
 
-      if (!(await fileExists(profile.authFilePath))) {
+      const currentHash = sha256(currentSnapshot.content);
+
+      for (const profile of otherProfiles) {
+        const savedPath = profile.authFilePaths[target];
+
+        if (!savedPath || !(await fileExists(savedPath))) {
+          continue;
+        }
+
+        const savedContent = await fs.readFile(savedPath);
+
+        if (sha256(savedContent) === currentHash) {
+          return profile.name;
+        }
+      }
+    }
+
+    for (const target of this.getTargetOrder(provider)) {
+      const metadata = currentSnapshots[target]?.metadata;
+
+      if (!metadata) {
         continue;
       }
 
-      const savedContent = await fs.readFile(profile.authFilePath);
-      if (sha256(savedContent) === currentHash) {
-        return profile.name;
+      if (metadata.accountId) {
+        const match = otherProfiles.find((profile) => profile.accountId === metadata.accountId);
+        if (match) {
+          return match.name;
+        }
+      }
+
+      if (metadata.email) {
+        const match = otherProfiles.find((profile) => profile.email === metadata.email);
+        if (match) {
+          return match.name;
+        }
       }
     }
 
-    const currentMetadata = parseAuthMetadata(currentContent.toString("utf8"));
-
-    if (currentMetadata.accountId) {
-      const matchingByAccountId = Object.values(state.profiles).find(
-        (profile) =>
-          profile.name !== targetProfileName && profile.accountId === currentMetadata.accountId
-      );
-      if (matchingByAccountId) {
-        return matchingByAccountId.name;
-      }
-    }
-
-    if (currentMetadata.email) {
-      const matchingByEmail = Object.values(state.profiles).find(
-        (profile) => profile.name !== targetProfileName && profile.email === currentMetadata.email
-      );
-      if (matchingByEmail) {
-        return matchingByEmail.name;
-      }
-    }
-
-    return state.activeProfile;
+    return state.activeProfiles[provider];
   }
+
+  private getTargetOrder(provider: SwitchProvider): AuthTarget[] {
+    return provider === "openai"
+      ? ["codex", "opencode-openai"]
+      : ["opencode-opencode"];
+  }
+}
+
+function isVersion2State(raw: unknown): raw is StateFile {
+  return (
+    isRecord(raw) &&
+    raw.version === 2 &&
+    isRecord(raw.activeProfiles) &&
+    isRecord(raw.profiles)
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function validateProfileName(name: string): void {
@@ -341,4 +859,8 @@ function validateProfileName(name: string): void {
       'Invalid profile name. Use only letters, numbers, ".", "_" and "-" and start with an alphanumeric character'
     );
   }
+}
+
+function failMissingRenamedProfile(): never {
+  throw new Error("Renamed profile did not contain any provider data");
 }
